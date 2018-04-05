@@ -1,0 +1,461 @@
+---
+resource_types:
+  - name: dput
+    type: docker-image
+    source:
+      repository: seveas/concourse-dput-resource
+
+  - name: ppa
+    type: docker-image
+    source:
+      repository: seveas/concourse-ppa-resource
+
+  - name: copr
+    type: docker-image
+    source:
+      repository: seveas/concourse-copr-resource
+
+resources:
+  - name: gitster-master
+    type: git
+    source:
+      uri: https://github.com/gitster/git.git
+      branch: master
+
+  - name: gitster-next
+    type: git
+    source:
+      uri: https://github.com/gitster/git.git
+      branch: next
+
+  - name: debian
+    type: git
+    source:
+      uri: git://anonscm.debian.org/users/jrnieder-guest/git.git
+      branch: debian-sid
+
+  - name: fedora
+    type: git
+    source: 
+      uri: git://pkgs.fedoraproject.org/git
+      branch: master
+
+  - name: dput-master
+    type: dput
+    source:
+      archive: ppa:dennis/git-master
+
+  - name: dput-next
+    type: dput
+    source:
+      archive: ppa:dennis/git-next
+
+  - name: copr-master
+    type: copr
+    source:
+      project: seveas/git-master
+      package: git
+      api_token: ((copr-token))
+
+  - name: copr-next
+    type: copr
+    source:
+      project: seveas/git-next
+      package: git
+      api_token: ((copr-token))
+
+  - name: ppa-master
+    type: ppa
+    source:
+      ppa: dennis/git-master
+      package: git
+      api_token: ((launchpad-token))
+
+  - name: ppa-next
+    type: ppa
+    source:
+      ppa: dennis/git-next
+      package: git
+      api_token: ((launchpad-token))
+
+jobs:
+  - name: test-master
+    plan:
+      - get: gitster-master
+        trigger: true
+      - task: test
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: seveas/build-git
+              tag: latest
+          inputs:
+            - name: gitster-master
+          run:
+            path: make
+            args:
+              - -C
+              - gitster-master
+              - test
+
+  - name: test-next
+    plan:
+      - get: gitster-next
+        trigger: true
+      - task: test
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: seveas/build-git
+              tag: latest
+          inputs:
+            - name: gitster-next
+          run:
+            path: make
+            args:
+              - -C
+              - gitster-next
+              - test
+
+  - name: build-master
+    plan:
+      - aggregate:
+        - get: gitster-master
+          trigger: true
+          passed: [test-master]
+        - get: debian
+        - get: fedora
+      - task: build
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: seveas/build-git
+              tag: latest
+          inputs:
+            - name: gitster-master
+          outputs:
+            - name: tarball
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                perl -E 'say $ENV{GPG_KEY}' | gpg --import
+                cd gitster-master
+                git config --global user.name "Git Test"
+                git config --global user.email git@test.invalid
+                # Generate a tarball with a version that matches packaging requirements better
+                make -j4 git
+                ./git describe --match 'v*' --exclude '*rc*' > version
+                sed -e 's/-g.*//' -e 's/^v//' -e 's/-/./g' -i version
+                # sed -e 's/$/.2/' -i version
+                make dist
+                # But in the tarball, we'd like the proper version!
+                version=$(cat version)
+                mv version ../tarball
+                rm GIT-VERSION-FILE
+                ./GIT-VERSION-GEN
+                sed -e 's/.*= *//' -i GIT-VERSION-FILE
+                gunzip git-$version.tar.gz
+                tar --xform=s@GIT-VERSION-FILE@git-$version/version@ -rf git-$version.tar GIT-VERSION-FILE
+                # The fedora specfile wants a gpg signature
+                gpg --sign --armor --detach-sign < git-$version.tar > ../tarball/git-$version.tar.sign
+                gzip -f -9 git-$version.tar
+                mv GIT-VERSION-FILE ../tarball/git-version
+                mv git-$version.tar.gz ../tarball
+                gpg --export --armor > ../tarball/gpg.key
+          params:
+            GPG_KEY: ((gpg-key))
+      - aggregate: 
+        - task: build-deb
+          config:
+            platform: linux
+            image_resource:
+              type: docker-image
+              source:
+                repository: seveas/build-git
+                tag: latest
+            inputs:
+              - name: tarball
+              - name: debian
+            outputs:
+              - name: debian-source
+            run:
+              path: sh
+              args:
+                - -exc
+                - |
+                  perl -E 'say $ENV{GPG_KEY}' | gpg --import
+                  cd tarball
+                  mkdir debian-build
+                  version=$(cat version)
+                  git_version=$(cat git-version)
+                  curl https://salsa.debian.org/debian/distro-info-data/raw/master/ubuntu.csv > /usr/share/distro-info/ubuntu.csv
+                  dist=$(python -c 'import distro_info; print(distro_info.UbuntuDistroInfo().devel())')
+                  cp git-$version.tar.gz debian-build/git_$version.orig.tar.gz
+                  cd debian-build
+                  tar zxf git_$version.orig.tar.gz
+                  cd git-$version
+                  mv ../../../debian/debian .
+                  rm -rf debian/patches
+                  sed -e 's/asciidoc[^,]*/asciidoc/' -i debian/control
+                  sed /3pm/d -i debian/git-svn.install
+                  dch -v 1:${version}-1 -u low --distribution $dist "Automated rebuild from $git_version"
+                  debuild -S -si
+                  cd ..
+                  mv git_$version* ../../debian-source/
+            params:
+              GPG_KEY: ((gpg-key))
+              DEBFULLNAME: Dennis Kaarsemaker
+              DEBEMAIL: dennis@kaarsemaker.net
+        - task: build-srpm
+          config:
+            platform: linux
+            image_resource:
+              type: docker-image
+              source:
+                repository: seveas/build-git
+                tag: latest
+            inputs:
+              - name: tarball
+              - name: fedora
+            outputs:
+              - name: srpm
+            run:
+              path: sh
+              args:
+                - -exc
+                - |
+                  version=$(cat tarball/version)
+                  # Patch up the version number and disable patches
+                  sed -e "s/^Version:.*/Version: $version/" \
+                      -e "s/^Release:.*/Release: 1/" \
+                      -e "s/^Source0:.*/Source0: git-$version.tar.xz/" \
+                      -e "s/^Source1:.*/Source1: git-$version.tar.sign/" \
+                      -e "s/^Source9:.*/Source9: gpg.key/" \
+                      -e "/^Patch[0-9]\+:*/d" \
+                      -e "/%global  *rcrev/d" \
+                      -i fedora/git.spec
+                  cp tarball/git-$version.tar.sign tarball/gpg.key fedora
+                  gunzip < tarball/git-$version.tar.gz | xz >  fedora/git-$version.tar.xz
+                  rpmbuild --define '_sourcedir fedora' --define '_srcrpmdir srpm' \
+                           --define '_topdir /tmp' -bs fedora/git.spec
+      - aggregate:
+        - put: copr-master
+          params:
+            glob: srpm/git*.src.rpm
+        - put: dput-master
+          params:
+            glob: debian-source/git*.changes
+
+  - name: build-next
+    plan:
+      - aggregate:
+        - get: gitster-next
+          trigger: true
+          passed: [test-next]
+        - get: debian
+        - get: fedora
+      - task: build
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: seveas/build-git
+              tag: latest
+          inputs:
+            - name: gitster-next
+          outputs:
+            - name: tarball
+          run:
+            path: sh
+            args:
+              - -exc
+              - |
+                perl -E 'say $ENV{GPG_KEY}' | gpg --import
+                cd gitster-next
+                git config --global user.name "Git Test"
+                git config --global user.email git@test.invalid
+                # Revert the commit that removes emacs things until debian/fedora have caught up
+                git revert --no-edit 0944224a8d4668c98e4eca0cbe67c4d0d88aa932
+                # Generate a tarball with a version that matches packaging requirements better
+                make -j4 git
+                ./git describe --match 'v*' --exclude '*rc*' > version
+                sed -e 's/-g.*//' -e 's/^v//' -e 's/-/./g' -i version
+                #sed -e 's/$/.2/' -i version
+                make dist
+                # But in the tarball, we'd like the proper version!
+                version=$(cat version)
+                mv version ../tarball
+                rm GIT-VERSION-FILE
+                ./GIT-VERSION-GEN
+                sed -e 's/.*= *//' -i GIT-VERSION-FILE
+                gunzip git-$version.tar.gz
+                tar --xform=s@GIT-VERSION-FILE@git-$version/version@ -rf git-$version.tar GIT-VERSION-FILE
+                # The fedora specfile wants a gpg signature
+                gpg --sign --armor --detach-sign < git-$version.tar > ../tarball/git-$version.tar.sign
+                gzip -f -9 git-$version.tar
+                mv GIT-VERSION-FILE ../tarball/git-version
+                mv git-$version.tar.gz ../tarball
+                gpg --export --armor > ../tarball/gpg.key
+          params:
+            GPG_KEY: ((gpg-key))
+      - aggregate: 
+        - task: build-deb
+          config:
+            platform: linux
+            image_resource:
+              type: docker-image
+              source:
+                repository: seveas/build-git
+                tag: latest
+            inputs:
+              - name: tarball
+              - name: debian
+            outputs:
+              - name: debian-source
+            run:
+              path: sh
+              args:
+                - -exc
+                - |
+                  perl -E 'say $ENV{GPG_KEY}' | gpg --import
+                  cd tarball
+                  mkdir debian-build
+                  version=$(cat version)
+                  git_version=$(cat git-version)
+                  curl https://salsa.debian.org/debian/distro-info-data/raw/master/ubuntu.csv > /usr/share/distro-info/ubuntu.csv
+                  dist=$(python -c 'import distro_info; print(distro_info.UbuntuDistroInfo().devel())')
+                  cp git-$version.tar.gz debian-build/git_$version.orig.tar.gz
+                  cd debian-build
+                  tar zxf git_$version.orig.tar.gz
+                  cd git-$version
+                  mv ../../../debian/debian .
+                  rm -rf debian/patches
+                  sed -e 's/asciidoc[^,]*/asciidoc/' -i debian/control
+                  sed /3pm/d -i debian/git-svn.install
+                  dch -v 1:${version}-1 -u low --distribution $dist "Automated rebuild from $git_version"
+                  debuild -S -si
+                  cd ..
+                  mv git_$version* ../../debian-source/
+            params:
+              GPG_KEY: ((gpg-key))
+              DEBFULLNAME: Dennis Kaarsemaker
+              DEBEMAIL: dennis@kaarsemaker.net
+        - task: build-srpm
+          config:
+            platform: linux
+            image_resource:
+              type: docker-image
+              source:
+                repository: seveas/build-git
+                tag: latest
+            inputs:
+              - name: tarball
+              - name: fedora
+            outputs:
+              - name: srpm
+            run:
+              path: sh
+              args:
+                - -exc
+                - |
+                  version=$(cat tarball/version)
+                  # Patch up the version number and disable patches
+                  sed -e "s/^Version:.*/Version: $version/" \
+                      -e "s/^Release:.*/Release: 1/" \
+                      -e "s/^Source0:.*/Source0: git-$version.tar.xz/" \
+                      -e "s/^Source1:.*/Source1: git-$version.tar.sign/" \
+                      -e "s/^Source9:.*/Source9: gpg.key/" \
+                      -e "/^Patch[0-9]\+:*/d" \
+                      -e "/%global  *rcrev/d" \
+                      -i fedora/git.spec
+                  cp tarball/git-$version.tar.sign tarball/gpg.key fedora
+                  gunzip < tarball/git-$version.tar.gz | xz >  fedora/git-$version.tar.xz
+                  rpmbuild --define '_sourcedir fedora' --define '_srcrpmdir srpm' \
+                           --define '_topdir /tmp' -bs fedora/git.spec
+      - aggregate:
+        - put: copr-next
+          params:
+            glob: srpm/git*.src.rpm
+        - put: dput-next
+          params:
+            glob: debian-source/git*.changes
+
+  - name: ppa-porter-master
+    plan:
+      - get: ppa-master
+        trigger: true
+      - task: split
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: seveas/concourse-ppa-resource
+              tag: latest
+          inputs:
+            - name: ppa-master
+          outputs:
+            - name: sources
+          run:
+            path: sh
+            args: 
+              - -exc
+              - |
+                perl -E 'say $ENV{GPG_KEY}' | gpg --import
+                apt-get update
+                apt-get -y install apache2-dev
+                ppa-split ppa-master ../sources
+          params:
+            GPG_KEY: ((gpg-key))
+            API_TOKEN: ((launchpad-token))
+            DEBFULLNAME: Dennis Kaarsemaker
+            DEBEMAIL: dennis@kaarsemaker.net
+      - put: dput-master
+        params:
+          glob: sources/*.changes
+          allow_noop: true
+
+  - name: ppa-porter-next
+    plan:
+      - get: ppa-next
+        trigger: true
+      - task: split
+        config:
+          platform: linux
+          image_resource:
+            type: docker-image
+            source:
+              repository: seveas/concourse-ppa-resource
+              tag: latest
+          inputs:
+            - name: ppa-next
+          outputs:
+            - name: sources
+          run:
+            path: sh
+            args: 
+              - -exc
+              - |
+                perl -E 'say $ENV{GPG_KEY}' | gpg --import
+                apt-get update
+                apt-get -y install apache2-dev
+                ppa-split ppa-next ../sources
+          params:
+            GPG_KEY: ((gpg-key))
+            API_TOKEN: ((launchpad-token))
+            DEBFULLNAME: Dennis Kaarsemaker
+            DEBEMAIL: dennis@kaarsemaker.net
+      - put: dput-next
+        params:
+          glob: sources/*.changes
+          allow_noop: true
+
