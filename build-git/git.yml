@@ -37,7 +37,7 @@ resources:
   - name: fedora
     type: git
     source: 
-      uri: git://pkgs.fedoraproject.org/git
+      uri: https://src.fedoraproject.org/rpms/git/
       branch: master
 
   - name: dput-master
