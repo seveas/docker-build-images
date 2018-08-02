@@ -286,7 +286,8 @@ jobs:
                 # Generate a tarball with a version that matches packaging requirements better
                 make -j4 git
                 ./git describe --match 'v*' --exclude '*rc*' > version
-                sed -e 's/-g.*//' -e 's/^v//' -e 's/-/./g' -i version
+                dt=$(date +%Y%m%d)
+                sed -e 's/-g.*//' -e 's/^v//' -e "s/-/.$dt./" -i version
                 #sed -e 's/$/.2/' -i version
                 make dist
                 # But in the tarball, we'd like the proper version!
