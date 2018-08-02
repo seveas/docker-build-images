@@ -283,8 +283,6 @@ jobs:
                 cd gitster-next
                 git config --global user.name "Git Test"
                 git config --global user.email git@test.invalid
-                # Revert the commit that removes emacs things until debian/fedora have caught up
-                git revert --no-edit 0944224a8d4668c98e4eca0cbe67c4d0d88aa932
                 # Generate a tarball with a version that matches packaging requirements better
                 make -j4 git
                 ./git describe --match 'v*' --exclude '*rc*' > version
